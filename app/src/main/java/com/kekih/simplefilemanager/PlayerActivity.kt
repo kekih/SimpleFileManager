@@ -2,34 +2,22 @@ package com.kekih.simplefilemanager
 
 import android.net.Uri
 import android.os.Bundle
-import android.view.LayoutInflater
+import android.os.Handler
+import android.os.Looper
+import android.view.View
 import android.view.WindowManager
+import android.widget.ImageButton
+import android.widget.SeekBar
+import android.widget.TextView
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.*
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.MusicNote
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -39,91 +27,218 @@ import androidx.media3.ui.PlayerView
 import java.io.File
 import java.util.concurrent.TimeUnit
 
+/**
+ * Pure Android Views player — no Compose interop.
+ * SurfaceView hardware overlay = smooth video without artifacts.
+ */
+@UnstableApi
 class PlayerActivity : ComponentActivity() {
 
     private var player: ExoPlayer? = null
+    private var playerView: PlayerView? = null
+    private var isAudio = false
+    private var userSeeking = false
 
-    @UnstableApi
+    private val handler = Handler(Looper.getMainLooper())
+    private val progressRunnable = object : Runnable {
+        override fun run() {
+            updateProgress()
+            handler.postDelayed(this, 500)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-        val path = intent.getStringExtra(EXTRA_PATH) ?: run {
+        val path = intent.getStringExtra(EXTRA_PATH)
+        if (path.isNullOrBlank()) {
             finish()
             return
         }
-        val isAudio = intent.getBooleanExtra(EXTRA_IS_AUDIO, false)
         val file = File(path)
-
         if (!file.exists()) {
             finish()
             return
         }
 
+        isAudio = intent.getBooleanExtra(EXTRA_IS_AUDIO, false)
+
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         if (!isAudio) {
             WindowCompat.setDecorFitsSystemWindows(window, false)
-            WindowInsetsControllerCompat(window, window.decorView).let { controller ->
-                controller.hide(WindowInsetsCompat.Type.systemBars())
-                controller.systemBarsBehavior =
+            WindowInsetsControllerCompat(window, window.decorView).apply {
+                hide(WindowInsetsCompat.Type.systemBars())
+                systemBarsBehavior =
                     WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             }
         }
 
-        val uri = try {
+        setContentView(R.layout.activity_player)
+
+        playerView = findViewById(R.id.player_view)
+        val audioUi = findViewById<View>(R.id.audio_ui)
+
+        if (isAudio) {
+            playerView?.visibility = View.GONE
+            audioUi.visibility = View.VISIBLE
+            setupAudioUi(file.name)
+        } else {
+            playerView?.visibility = View.VISIBLE
+            audioUi.visibility = View.GONE
+        }
+
+        val uri = resolveUri(file)
+        player = buildPlayer().also { exo ->
+            exo.setMediaItem(MediaItem.fromUri(uri))
+            exo.prepare()
+            exo.playWhenReady = true
+
+            if (!isAudio) {
+                playerView?.player = exo
+            }
+
+            exo.addListener(object : Player.Listener {
+                override fun onPlaybackStateChanged(state: Int) {
+                    if (state == Player.STATE_READY && isAudio) {
+                        findViewById<TextView>(R.id.time_total)?.text =
+                            formatTime(exo.duration.coerceAtLeast(0))
+                    }
+                    if (state == Player.STATE_ENDED) {
+                        exo.seekTo(0)
+                        exo.pause()
+                        updatePlayPauseButton(false)
+                    }
+                }
+
+                override fun onIsPlayingChanged(playing: Boolean) {
+                    updatePlayPauseButton(playing)
+                }
+
+                override fun onPlayerError(error: PlaybackException) {
+                    // Try software decoder fallback once
+                    android.widget.Toast.makeText(
+                        this@PlayerActivity,
+                        "Ошибка воспроизведения: ${error.message?.take(80)}",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            })
+        }
+    }
+
+    private fun resolveUri(file: File): Uri {
+        return try {
             FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
         } catch (_: Exception) {
             Uri.fromFile(file)
         }
+    }
 
-        // Extension renderer mode + larger buffers reduce stuttering / artifacts
+    private fun buildPlayer(): ExoPlayer {
+        // Prefer hardware, fall back to software — reduces artifacts on weak GPUs
         val renderersFactory = DefaultRenderersFactory(this)
-            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
             .setEnableDecoderFallback(true)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
 
+        // Smaller, tighter buffers = less lag / memory pressure on phones
         val loadControl = DefaultLoadControl.Builder()
             .setBufferDurationsMs(
-                15_000, // min buffer
-                50_000, // max buffer
-                1_500,  // buffer for playback
-                3_000   // buffer for playback after rebuffer
+                /* minBufferMs */ 5_000,
+                /* maxBufferMs */ 20_000,
+                /* bufferForPlaybackMs */ 1_000,
+                /* bufferForPlaybackAfterRebufferMs */ 2_000
             )
+            .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
-        player = ExoPlayer.Builder(this, renderersFactory)
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+            .build()
+
+        return ExoPlayer.Builder(this, renderersFactory)
             .setLoadControl(loadControl)
+            .setHandleAudioBecomingNoisy(true)
+            .setAudioAttributes(audioAttributes, /* handleAudioFocus = */ true)
             .build()
-            .apply {
-                setMediaItem(MediaItem.fromUri(uri))
-                prepare()
-                playWhenReady = true
-                repeatMode = Player.REPEAT_MODE_OFF
+    }
+
+    private fun setupAudioUi(fileName: String) {
+        findViewById<TextView>(R.id.audio_title)?.text = fileName
+
+        findViewById<ImageButton>(R.id.btn_back_audio)?.setOnClickListener { finish() }
+
+        val playPause = findViewById<ImageButton>(R.id.btn_play_pause)
+        playPause?.setOnClickListener {
+            val p = player ?: return@setOnClickListener
+            if (p.isPlaying) p.pause() else p.play()
+        }
+
+        val seekBar = findViewById<SeekBar>(R.id.seek_bar)
+        seekBar?.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                val p = player ?: return
+                val dur = p.duration
+                if (dur > 0) {
+                    val pos = progress * dur / 1000
+                    findViewById<TextView>(R.id.time_current)?.text = formatTime(pos)
+                }
             }
 
-        setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
-                PlayerScreen(
-                    fileName = file.name,
-                    isAudio = isAudio,
-                    player = player!!,
-                    onBack = { finish() }
-                )
+            override fun onStartTrackingTouch(sb: SeekBar?) {
+                userSeeking = true
             }
+
+            override fun onStopTrackingTouch(sb: SeekBar?) {
+                userSeeking = false
+                val p = player ?: return
+                val dur = p.duration
+                if (dur > 0 && sb != null) {
+                    p.seekTo(sb.progress * dur / 1000)
+                }
+            }
+        })
+    }
+
+    private fun updateProgress() {
+        if (userSeeking) return
+        val p = player ?: return
+        val dur = p.duration
+        val pos = p.currentPosition.coerceAtLeast(0)
+        if (dur > 0) {
+            findViewById<SeekBar>(R.id.seek_bar)?.progress =
+                ((pos * 1000) / dur).toInt().coerceIn(0, 1000)
+            findViewById<TextView>(R.id.time_total)?.text = formatTime(dur)
         }
+        findViewById<TextView>(R.id.time_current)?.text = formatTime(pos)
+    }
+
+    private fun updatePlayPauseButton(playing: Boolean) {
+        if (!isAudio) return
+        findViewById<ImageButton>(R.id.btn_play_pause)?.setImageResource(
+            if (playing) android.R.drawable.ic_media_pause
+            else android.R.drawable.ic_media_play
+        )
     }
 
     override fun onStart() {
         super.onStart()
+        if (isAudio) handler.post(progressRunnable)
         player?.playWhenReady = true
     }
 
     override fun onStop() {
         super.onStop()
+        handler.removeCallbacks(progressRunnable)
         player?.pause()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        handler.removeCallbacks(progressRunnable)
+        playerView?.player = null
         player?.release()
         player = null
     }
@@ -131,210 +246,13 @@ class PlayerActivity : ComponentActivity() {
     companion object {
         const val EXTRA_PATH = "path"
         const val EXTRA_IS_AUDIO = "is_audio"
-    }
-}
 
-@UnstableApi
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun PlayerScreen(
-    fileName: String,
-    isAudio: Boolean,
-    player: ExoPlayer,
-    onBack: () -> Unit
-) {
-    val lifecycleOwner = LocalLifecycleOwner.current
-
-    DisposableEffect(lifecycleOwner, player) {
-        val observer = LifecycleEventObserver { _, event ->
-            when (event) {
-                Lifecycle.Event.ON_STOP -> player.pause()
-                else -> {}
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
+        fun formatTime(ms: Long): String {
+            if (ms <= 0) return "0:00"
+            val totalSec = TimeUnit.MILLISECONDS.toSeconds(ms)
+            val m = totalSec / 60
+            val s = totalSec % 60
+            return "%d:%02d".format(m, s)
         }
     }
-
-    var isPlaying by remember { mutableStateOf(player.isPlaying) }
-    var position by remember { mutableLongStateOf(0L) }
-    var duration by remember { mutableLongStateOf(0L) }
-
-    DisposableEffect(player) {
-        val listener = object : Player.Listener {
-            override fun onIsPlayingChanged(playing: Boolean) {
-                isPlaying = playing
-            }
-
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_READY) {
-                    duration = player.duration.coerceAtLeast(0L)
-                }
-            }
-        }
-        player.addListener(listener)
-        onDispose { player.removeListener(listener) }
-    }
-
-    LaunchedEffect(player) {
-        while (true) {
-            position = player.currentPosition.coerceAtLeast(0L)
-            if (player.duration > 0) duration = player.duration
-            kotlinx.coroutines.delay(250)
-        }
-    }
-
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black)
-    ) {
-        if (isAudio) {
-            // Pure Compose UI — no SurfaceView/PlayerView = no artifacts
-            Column(
-                modifier = Modifier.fillMaxSize(),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                TopAppBar(
-                    title = {
-                        Text(
-                            fileName,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            color = Color.White
-                        )
-                    },
-                    navigationIcon = {
-                        IconButton(onClick = onBack) {
-                            Icon(
-                                Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Назад",
-                                tint = Color.White
-                            )
-                        }
-                    },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = Color.Transparent
-                    )
-                )
-
-                Spacer(Modifier.weight(1f))
-
-                Icon(
-                    Icons.Default.MusicNote,
-                    contentDescription = null,
-                    modifier = Modifier.size(140.dp),
-                    tint = Color.White.copy(alpha = 0.85f)
-                )
-
-                Spacer(Modifier.height(24.dp))
-
-                Text(
-                    fileName,
-                    color = Color.White,
-                    style = MaterialTheme.typography.titleMedium,
-                    textAlign = TextAlign.Center,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(horizontal = 32.dp)
-                )
-
-                Spacer(Modifier.weight(1f))
-
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 24.dp)
-                ) {
-                    Slider(
-                        value = if (duration > 0) (position.toFloat() / duration).coerceIn(0f, 1f) else 0f,
-                        onValueChange = { ratio ->
-                            val seek = (ratio * duration).toLong()
-                            player.seekTo(seek)
-                            position = seek
-                        },
-                        colors = SliderDefaults.colors(
-                            thumbColor = Color.White,
-                            activeTrackColor = Color.White,
-                            inactiveTrackColor = Color.White.copy(alpha = 0.3f)
-                        )
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            formatTime(position),
-                            color = Color.White.copy(alpha = 0.7f),
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                        Text(
-                            formatTime(duration),
-                            color = Color.White.copy(alpha = 0.7f),
-                            style = MaterialTheme.typography.bodySmall
-                        )
-                    }
-                }
-
-                Spacer(Modifier.height(16.dp))
-
-                IconButton(
-                    onClick = {
-                        if (player.isPlaying) player.pause() else player.play()
-                    },
-                    modifier = Modifier.size(72.dp)
-                ) {
-                    Icon(
-                        if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                        contentDescription = if (isPlaying) "Пауза" else "Играть",
-                        modifier = Modifier.size(48.dp),
-                        tint = Color.White
-                    )
-                }
-
-                Spacer(Modifier.height(48.dp))
-            }
-        } else {
-            // Video: inflate XML with surface_type=texture_view (fixes artifacts)
-            AndroidView(
-                factory = { ctx ->
-                    val view = LayoutInflater.from(ctx)
-                        .inflate(R.layout.player_view, null, false) as PlayerView
-                    view.player = player
-                    view.keepScreenOn = true
-                    view
-                },
-                update = { view ->
-                    if (view.player != player) {
-                        view.player = player
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
-
-            IconButton(
-                onClick = onBack,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .statusBarsPadding()
-                    .padding(8.dp)
-            ) {
-                Icon(
-                    Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = "Назад",
-                    tint = Color.White
-                )
-            }
-        }
-    }
-}
-
-private fun formatTime(ms: Long): String {
-    if (ms <= 0) return "0:00"
-    val totalSec = TimeUnit.MILLISECONDS.toSeconds(ms)
-    val m = totalSec / 60
-    val s = totalSec % 60
-    return "%d:%02d".format(m, s)
 }
