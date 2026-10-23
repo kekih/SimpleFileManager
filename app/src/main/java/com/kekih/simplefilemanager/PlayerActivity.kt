@@ -2,6 +2,7 @@ package com.kekih.simplefilemanager
 
 import android.net.Uri
 import android.os.Bundle
+import android.view.LayoutInflater
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -17,7 +18,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -32,8 +32,9 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import java.io.File
 import java.util.concurrent.TimeUnit
@@ -46,7 +47,6 @@ class PlayerActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Keep screen on while playing
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         val path = intent.getStringExtra(EXTRA_PATH) ?: run {
@@ -61,7 +61,6 @@ class PlayerActivity : ComponentActivity() {
             return
         }
 
-        // Hide system bars for video
         if (!isAudio) {
             WindowCompat.setDecorFitsSystemWindows(window, false)
             WindowInsetsControllerCompat(window, window.decorView).let { controller ->
@@ -73,11 +72,26 @@ class PlayerActivity : ComponentActivity() {
 
         val uri = try {
             FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             Uri.fromFile(file)
         }
 
-        player = ExoPlayer.Builder(this)
+        // Extension renderer mode + larger buffers reduce stuttering / artifacts
+        val renderersFactory = DefaultRenderersFactory(this)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+            .setEnableDecoderFallback(true)
+
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                15_000, // min buffer
+                50_000, // max buffer
+                1_500,  // buffer for playback
+                3_000   // buffer for playback after rebuffer
+            )
+            .build()
+
+        player = ExoPlayer.Builder(this, renderersFactory)
+            .setLoadControl(loadControl)
             .build()
             .apply {
                 setMediaItem(MediaItem.fromUri(uri))
@@ -131,14 +145,9 @@ fun PlayerScreen(
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    // Sync player with lifecycle (prevents surface artifacts on pause/resume)
     DisposableEffect(lifecycleOwner, player) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_PAUSE -> player.pause()
-                Lifecycle.Event.ON_RESUME -> {
-                    // don't auto-resume if user paused
-                }
                 Lifecycle.Event.ON_STOP -> player.pause()
                 else -> {}
             }
@@ -169,12 +178,11 @@ fun PlayerScreen(
         onDispose { player.removeListener(listener) }
     }
 
-    // Progress ticker
     LaunchedEffect(player) {
         while (true) {
             position = player.currentPosition.coerceAtLeast(0L)
             if (player.duration > 0) duration = player.duration
-            kotlinx.coroutines.delay(200)
+            kotlinx.coroutines.delay(250)
         }
     }
 
@@ -184,7 +192,7 @@ fun PlayerScreen(
             .background(Color.Black)
     ) {
         if (isAudio) {
-            // ——— Audio UI (no PlayerView surface = no artifacts) ———
+            // Pure Compose UI — no SurfaceView/PlayerView = no artifacts
             Column(
                 modifier = Modifier.fillMaxSize(),
                 horizontalAlignment = Alignment.CenterHorizontally
@@ -235,14 +243,13 @@ fun PlayerScreen(
 
                 Spacer(Modifier.weight(1f))
 
-                // Progress
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 24.dp)
                 ) {
                     Slider(
-                        value = if (duration > 0) position.toFloat() / duration else 0f,
+                        value = if (duration > 0) (position.toFloat() / duration).coerceIn(0f, 1f) else 0f,
                         onValueChange = { ratio ->
                             val seek = (ratio * duration).toLong()
                             player.seekTo(seek)
@@ -258,8 +265,16 @@ fun PlayerScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text(formatTime(position), color = Color.White.copy(alpha = 0.7f), style = MaterialTheme.typography.bodySmall)
-                        Text(formatTime(duration), color = Color.White.copy(alpha = 0.7f), style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            formatTime(position),
+                            color = Color.White.copy(alpha = 0.7f),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Text(
+                            formatTime(duration),
+                            color = Color.White.copy(alpha = 0.7f),
+                            style = MaterialTheme.typography.bodySmall
+                        )
                     }
                 }
 
@@ -282,27 +297,14 @@ fun PlayerScreen(
                 Spacer(Modifier.height(48.dp))
             }
         } else {
-            // ——— Video: TextureView avoids SurfaceView artifacts under Compose ———
+            // Video: inflate XML with surface_type=texture_view (fixes artifacts)
             AndroidView(
                 factory = { ctx ->
-                    PlayerView(ctx).apply {
-                        this.player = player
-                        useController = true
-                        // TextureView is required to avoid green/black flashes & tearing in Compose
-                        setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
-                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                        // Force TextureView via reflection-safe approach: set in layout XML equivalent
-                        // PlayerView defaults to SurfaceView; switch:
-                        setShutterBackgroundColor(android.graphics.Color.BLACK)
-                        keepScreenOn = true
-                    }.also { view ->
-                        // Prefer texture view to eliminate artifacts with Compose interop
-                        try {
-                            val field = PlayerView::class.java.getDeclaredField("surfaceType")
-                            // surface type is set at construction from attrs; recreate with texture:
-                        } catch (_: Exception) {
-                        }
-                    }
+                    val view = LayoutInflater.from(ctx)
+                        .inflate(R.layout.player_view, null, false) as PlayerView
+                    view.player = player
+                    view.keepScreenOn = true
+                    view
                 },
                 update = { view ->
                     if (view.player != player) {
@@ -312,7 +314,6 @@ fun PlayerScreen(
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Back button overlay
             IconButton(
                 onClick = onBack,
                 modifier = Modifier
