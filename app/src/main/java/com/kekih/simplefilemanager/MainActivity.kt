@@ -21,6 +21,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -28,6 +29,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.File
@@ -42,22 +45,17 @@ class MainActivity : ComponentActivity() {
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        if (permissions.all { it.value }) {
-            // ok
-        } else {
+        if (!permissions.all { it.value }) {
             Toast.makeText(this, "Нужны разрешения для доступа к файлам", Toast.LENGTH_LONG).show()
         }
     }
 
     private val installPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
-    ) {
-        // user returned from settings
-    }
+    ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         requestStoragePermissions()
 
         setContent {
@@ -66,8 +64,8 @@ class MainActivity : ComponentActivity() {
             ) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     FileManagerScreen(
-                        onInstallApk = { file -> installApk(file) },
-                        onInstallXapk = { file -> installXapk(file) },
+                        onInstallApk = { installApk(it) },
+                        onInstallXapk = { installXapk(it) },
                         onPlayMedia = { file, isAudio -> openPlayer(file, isAudio) }
                     )
                 }
@@ -79,12 +77,13 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!Environment.isExternalStorageManager()) {
                 try {
-                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                    intent.data = Uri.parse("package:$packageName")
-                    startActivity(intent)
-                } catch (e: Exception) {
-                    val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
-                    startActivity(intent)
+                    startActivity(
+                        Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                            data = Uri.parse("package:$packageName")
+                        }
+                    )
+                } catch (_: Exception) {
+                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
                 }
             }
         } else {
@@ -100,19 +99,18 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun canInstallPackages(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            packageManager.canRequestPackageInstalls()
-        } else true
-    }
+    private fun canInstallPackages(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) packageManager.canRequestPackageInstalls()
+        else true
 
     private fun requestInstallPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                Uri.parse("package:$packageName")
+            installPermissionLauncher.launch(
+                Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:$packageName")
+                )
             )
-            installPermissionLauncher.launch(intent)
             Toast.makeText(this, "Разрешите установку из неизвестных источников", Toast.LENGTH_LONG).show()
         }
     }
@@ -127,17 +125,13 @@ class MainActivity : ComponentActivity() {
             return
         }
         try {
-            val uri = FileProvider.getUriForFile(
-                this,
-                "$packageName.fileprovider",
-                file
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            startActivity(
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
             )
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            startActivity(intent)
         } catch (e: Exception) {
             Toast.makeText(this, "Ошибка установки: ${e.message}", Toast.LENGTH_LONG).show()
         }
@@ -177,7 +171,6 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Find main APK (prefer base.apk or largest .apk)
                 val apks = extractDir.walkTopDown()
                     .filter { it.isFile && it.extension.equals("apk", ignoreCase = true) }
                     .toList()
@@ -194,16 +187,9 @@ class MainActivity : ComponentActivity() {
                     it.name.equals("base.apk", true) || it.name.contains("base", true)
                 } ?: apks.maxByOrNull { it.length() } ?: apks.first()
 
-                // Copy OBB if present
-                val obbFiles = extractDir.walkTopDown()
+                extractDir.walkTopDown()
                     .filter { it.isFile && it.extension.equals("obb", ignoreCase = true) }
-                    .toList()
-
-                if (obbFiles.isNotEmpty()) {
-                    val obbDir = File(Environment.getExternalStorageDirectory(), "Android/obb")
-                    // package name from manifest is hard without parsing; put next to apk for now
-                    // Many XAPKs have android/obb/<package>/ structure already
-                    for (obb in obbFiles) {
+                    .forEach { obb ->
                         try {
                             val relative = obb.relativeTo(extractDir).path
                             if (relative.contains("Android/obb", ignoreCase = true) ||
@@ -216,7 +202,6 @@ class MainActivity : ComponentActivity() {
                         } catch (_: Exception) {
                         }
                     }
-                }
 
                 runOnUiThread {
                     Toast.makeText(this, "Установка ${mainApk.name}...", Toast.LENGTH_SHORT).show()
@@ -231,27 +216,23 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun openPlayer(file: File, isAudio: Boolean) {
-        val intent = Intent(this, PlayerActivity::class.java).apply {
-            putExtra(PlayerActivity.EXTRA_PATH, file.absolutePath)
-            putExtra(PlayerActivity.EXTRA_IS_AUDIO, isAudio)
-        }
-        startActivity(intent)
+        startActivity(
+            Intent(this, PlayerActivity::class.java).apply {
+                putExtra(PlayerActivity.EXTRA_PATH, file.absolutePath)
+                putExtra(PlayerActivity.EXTRA_IS_AUDIO, isAudio)
+            }
+        )
     }
 }
 
 @Composable
-fun isSystemInDarkTheme(): Boolean {
-    return androidx.compose.foundation.isSystemInDarkTheme()
-}
+fun isSystemInDarkTheme(): Boolean = androidx.compose.foundation.isSystemInDarkTheme()
 
-enum class FileType {
-    FOLDER, APK, XAPK, AUDIO, VIDEO, IMAGE, OTHER
-}
+enum class FileType { FOLDER, APK, XAPK, AUDIO, VIDEO, IMAGE, OTHER }
 
 fun getFileType(file: File): FileType {
     if (file.isDirectory) return FileType.FOLDER
-    val ext = file.extension.lowercase()
-    return when (ext) {
+    return when (file.extension.lowercase()) {
         "apk" -> FileType.APK
         "xapk", "apks", "apkm" -> FileType.XAPK
         "mp3", "wav", "ogg", "m4a", "flac", "aac", "wma", "opus" -> FileType.AUDIO
@@ -261,15 +242,13 @@ fun getFileType(file: File): FileType {
     }
 }
 
-fun getFileIcon(type: FileType): ImageVector {
-    return when (type) {
-        FileType.FOLDER -> Icons.Default.Folder
-        FileType.APK, FileType.XAPK -> Icons.Default.Android
-        FileType.AUDIO -> Icons.Default.AudioFile
-        FileType.VIDEO -> Icons.Default.VideoFile
-        FileType.IMAGE -> Icons.Default.Image
-        FileType.OTHER -> Icons.Default.InsertDriveFile
-    }
+fun getFileIcon(type: FileType): ImageVector = when (type) {
+    FileType.FOLDER -> Icons.Default.Folder
+    FileType.APK, FileType.XAPK -> Icons.Default.Android
+    FileType.AUDIO -> Icons.Default.AudioFile
+    FileType.VIDEO -> Icons.Default.VideoFile
+    FileType.IMAGE -> Icons.Default.Image
+    FileType.OTHER -> Icons.Default.InsertDriveFile
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -284,26 +263,33 @@ fun FileManagerScreen(
         mutableStateOf(Environment.getExternalStorageDirectory().absolutePath)
     }
     var files by remember { mutableStateOf(listOf<File>()) }
+    var loading by remember { mutableStateOf(false) }
     var showCreateDialog by remember { mutableStateOf(false) }
     var showRenameDialog by remember { mutableStateOf(false) }
     var selectedFile by remember { mutableStateOf<File?>(null) }
     var newName by remember { mutableStateOf("") }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     var showActionDialog by remember { mutableStateOf(false) }
+    var refreshKey by remember { mutableIntStateOf(0) }
 
-    fun loadFiles(path: String) {
-        val dir = File(path)
-        if (dir.exists() && dir.isDirectory) {
-            files = dir.listFiles()?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
-                ?: emptyList()
-        } else {
+    // Load directory off the main thread — main lag source on big folders
+    LaunchedEffect(currentPath, refreshKey) {
+        loading = true
+        val result = withContext(Dispatchers.IO) {
+            val dir = File(currentPath)
+            if (dir.exists() && dir.isDirectory) {
+                dir.listFiles()
+                    ?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+                    ?: emptyList()
+            } else null
+        }
+        loading = false
+        if (result == null) {
             files = emptyList()
             Toast.makeText(context, "Не удалось открыть папку", Toast.LENGTH_SHORT).show()
+        } else {
+            files = result
         }
-    }
-
-    LaunchedEffect(currentPath) {
-        loadFiles(currentPath)
     }
 
     fun handleFileClick(file: File) {
@@ -316,16 +302,15 @@ fun FileManagerScreen(
             FileType.IMAGE -> {
                 try {
                     val uri = FileProvider.getUriForFile(
-                        context,
-                        "${context.packageName}.fileprovider",
-                        file
+                        context, "${context.packageName}.fileprovider", file
                     )
-                    val intent = Intent(Intent.ACTION_VIEW).apply {
-                        setDataAndType(uri, "image/*")
-                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                    }
-                    context.startActivity(intent)
-                } catch (e: Exception) {
+                    context.startActivity(
+                        Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, "image/*")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                    )
+                } catch (_: Exception) {
                     Toast.makeText(context, "Не удалось открыть изображение", Toast.LENGTH_SHORT).show()
                 }
             }
@@ -353,15 +338,14 @@ fun FileManagerScreen(
                 navigationIcon = {
                     if (currentPath != Environment.getExternalStorageDirectory().absolutePath) {
                         IconButton(onClick = {
-                            val parent = File(currentPath).parentFile
-                            if (parent != null) currentPath = parent.absolutePath
+                            File(currentPath).parentFile?.let { currentPath = it.absolutePath }
                         }) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Назад")
                         }
                     }
                 },
                 actions = {
-                    IconButton(onClick = { loadFiles(currentPath) }) {
+                    IconButton(onClick = { refreshKey++ }) {
                         Icon(Icons.Default.Refresh, contentDescription = "Обновить")
                     }
                     IconButton(onClick = { showCreateDialog = true }) {
@@ -371,25 +355,30 @@ fun FileManagerScreen(
             )
         }
     ) { padding ->
-        LazyColumn(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            items(files) { file ->
-                FileItem(
-                    file = file,
-                    onClick = { handleFileClick(file) },
-                    onLongClick = {
-                        selectedFile = file
-                        showDeleteConfirm = true
-                    },
-                    onRename = {
-                        selectedFile = file
-                        newName = file.name
-                        showRenameDialog = true
-                    }
-                )
+            if (loading && files.isEmpty()) {
+                CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+            }
+            LazyColumn(modifier = Modifier.fillMaxSize()) {
+                items(files, key = { it.absolutePath }) { file ->
+                    FileItem(
+                        file = file,
+                        onClick = { handleFileClick(file) },
+                        onRename = {
+                            selectedFile = file
+                            newName = file.name
+                            showRenameDialog = true
+                        },
+                        onDelete = {
+                            selectedFile = file
+                            showDeleteConfirm = true
+                        }
+                    )
+                }
             }
         }
     }
@@ -409,9 +398,8 @@ fun FileManagerScreen(
             confirmButton = {
                 TextButton(onClick = {
                     if (newName.isNotBlank()) {
-                        val newDir = File(currentPath, newName)
-                        if (newDir.mkdir()) {
-                            loadFiles(currentPath)
+                        if (File(currentPath, newName).mkdir()) {
+                            refreshKey++
                             Toast.makeText(context, "Папка создана", Toast.LENGTH_SHORT).show()
                         } else {
                             Toast.makeText(context, "Ошибка создания", Toast.LENGTH_SHORT).show()
@@ -419,17 +407,13 @@ fun FileManagerScreen(
                     }
                     newName = ""
                     showCreateDialog = false
-                }) {
-                    Text("Создать")
-                }
+                }) { Text("Создать") }
             },
             dismissButton = {
                 TextButton(onClick = {
                     newName = ""
                     showCreateDialog = false
-                }) {
-                    Text("Отмена")
-                }
+                }) { Text("Отмена") }
             }
         )
     }
@@ -449,9 +433,8 @@ fun FileManagerScreen(
             confirmButton = {
                 TextButton(onClick = {
                     selectedFile?.let { file ->
-                        val newFile = File(file.parent, newName)
-                        if (file.renameTo(newFile)) {
-                            loadFiles(currentPath)
+                        if (file.renameTo(File(file.parent, newName))) {
+                            refreshKey++
                             Toast.makeText(context, "Переименовано", Toast.LENGTH_SHORT).show()
                         } else {
                             Toast.makeText(context, "Ошибка", Toast.LENGTH_SHORT).show()
@@ -460,18 +443,14 @@ fun FileManagerScreen(
                     showRenameDialog = false
                     selectedFile = null
                     newName = ""
-                }) {
-                    Text("OK")
-                }
+                }) { Text("OK") }
             },
             dismissButton = {
                 TextButton(onClick = {
                     showRenameDialog = false
                     selectedFile = null
                     newName = ""
-                }) {
-                    Text("Отмена")
-                }
+                }) { Text("Отмена") }
             }
         )
     }
@@ -484,9 +463,9 @@ fun FileManagerScreen(
             confirmButton = {
                 TextButton(onClick = {
                     selectedFile?.let { file ->
-                        val success = if (file.isDirectory) file.deleteRecursively() else file.delete()
-                        if (success) {
-                            loadFiles(currentPath)
+                        val ok = if (file.isDirectory) file.deleteRecursively() else file.delete()
+                        if (ok) {
+                            refreshKey++
                             Toast.makeText(context, "Удалено", Toast.LENGTH_SHORT).show()
                         } else {
                             Toast.makeText(context, "Ошибка удаления", Toast.LENGTH_SHORT).show()
@@ -502,9 +481,7 @@ fun FileManagerScreen(
                 TextButton(onClick = {
                     showDeleteConfirm = false
                     selectedFile = null
-                }) {
-                    Text("Отмена")
-                }
+                }) { Text("Отмена") }
             }
         )
     }
@@ -518,31 +495,29 @@ fun FileManagerScreen(
                 TextButton(onClick = {
                     try {
                         val uri = FileProvider.getUriForFile(
-                            context,
-                            "${context.packageName}.fileprovider",
-                            selectedFile!!
+                            context, "${context.packageName}.fileprovider", selectedFile!!
                         )
-                        val intent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(uri, "*/*")
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        }
-                        context.startActivity(Intent.createChooser(intent, "Открыть с помощью"))
-                    } catch (e: Exception) {
+                        context.startActivity(
+                            Intent.createChooser(
+                                Intent(Intent.ACTION_VIEW).apply {
+                                    setDataAndType(uri, "*/*")
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                },
+                                "Открыть с помощью"
+                            )
+                        )
+                    } catch (_: Exception) {
                         Toast.makeText(context, "Не удалось открыть", Toast.LENGTH_SHORT).show()
                     }
                     showActionDialog = false
                     selectedFile = null
-                }) {
-                    Text("Открыть")
-                }
+                }) { Text("Открыть") }
             },
             dismissButton = {
                 TextButton(onClick = {
                     showActionDialog = false
                     selectedFile = null
-                }) {
-                    Text("Отмена")
-                }
+                }) { Text("Отмена") }
             }
         )
     }
@@ -552,19 +527,15 @@ fun FileManagerScreen(
 fun FileItem(
     file: File,
     onClick: () -> Unit,
-    onLongClick: () -> Unit,
-    onRename: () -> Unit
+    onRename: () -> Unit,
+    onDelete: () -> Unit
 ) {
     val dateFormat = remember { SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()) }
-    val type = getFileType(file)
+    val type = remember(file.absolutePath) { getFileType(file) }
 
     ListItem(
         headlineContent = {
-            Text(
-                file.name,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            Text(file.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
         },
         supportingContent = {
             Text(
@@ -604,8 +575,13 @@ fun FileItem(
             )
         },
         trailingContent = {
-            IconButton(onClick = onRename) {
-                Icon(Icons.Default.Edit, contentDescription = "Переименовать")
+            Row {
+                IconButton(onClick = onRename) {
+                    Icon(Icons.Default.Edit, contentDescription = "Переименовать")
+                }
+                IconButton(onClick = onDelete) {
+                    Icon(Icons.Default.Delete, contentDescription = "Удалить")
+                }
             }
         },
         modifier = Modifier.clickable(onClick = onClick)
@@ -619,6 +595,5 @@ fun formatSize(bytes: Long): String {
     if (kb < 1024) return "%.1f KB".format(kb)
     val mb = kb / 1024.0
     if (mb < 1024) return "%.1f MB".format(mb)
-    val gb = mb / 1024.0
-    return "%.2f GB".format(gb)
+    return "%.2f GB".format(mb / 1024.0)
 }
